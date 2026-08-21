@@ -1,5 +1,5 @@
 #!/bin/bash
-# Script Universal de Expansión de Disco para VPS
+# Script Universal de Expansión de Disco para VPS (Versión Corregida)
 
 if [ "$EUID" -ne 0 ]; then
   echo "❌ Por favor, ejecuta como root (sudo)."
@@ -12,40 +12,55 @@ for dev in /sys/class/scsi_device/*; do echo 1 > "$dev/device/rescan" 2>/dev/nul
 sleep 2
 
 echo "📦 2. Instalando herramientas esenciales..."
-apt-get update -y && apt-get install -y cloud-guest-utils grep awk
+apt-get update -y && apt-get install -y cloud-guest-utils
 
-# Detectar el disco principal y la partición LVM activa
-DISK_LINE=$(lsblk -po NAME,FSTYPE | grep "LVM2_member" | head -n 1)
-LV_PATH=$(df /var | tail -n 1 | awk '{print $1}')
-
-if [ -z "$DISK_LINE" ]; then
-    # Si no es LVM, busca la partición raíz común
+# Detectar automáticamente qué volumen lógico o partición tiene /var (o la raíz / si /var no está separado)
+if df /var | grep -q "/dev/"; then
+    LV_PATH=$(df /var | tail -n 1 | awk '{print $1}')
+else
     LV_PATH=$(df / | tail -n 1 | awk '{print $1}')
-    DISK_LINE=$(lsblk -po NAME,FSTYPE | grep -E "$(basename $LV_PATH)" -B 2 | head -n 1)
 fi
 
-FULL_PART=$(echo "$DISK_LINE" | awk '{print $1}')
-# Extraer el disco base (ej: /dev/sda o /dev/vda) y el número de partición
+echo "📌 Destino detectado: $LV_PATH"
+
+# Encontrar el disco físico base y el número de partición de forma dinámica
+# Esto funciona tanto para sda, vda, nvme0n1, xvda, etc.
+if [[ "$LV_PATH" == *"/dev/mapper/"* ]] || [[ "$LV_PATH" == *"/dev/ubuntu-vg/"* ]]; then
+    # Si usa LVM, buscamos el miembro LVM subyacente
+    FULL_PART=$(pvs --noheadings -o pv_name | tr -d '[:space:]')
+else
+    FULL_PART=$LV_PATH
+fi
+
+# Extraer el disco padre y el número de la partición usando las herramientas del sistema
 PARENT_DISK=$(lsblk -no PKNAME "$FULL_PART" | head -n 1)
-PART_NUM=$(echo "$FULL_PART" | grep -oE '[0-9]+$')
+PART_NUM=$(lsblk -no PARTNUMBER "$FULL_PART" | head -n 1)
+
+# Respaldo si los comandos anteriores no devuelven datos limpios
+if [ -z "$PARENT_DISK" ] || [ -z "$PART_NUM" ]; then
+    PARENT_DISK=$(echo "$FULL_PART" | sed -E 's/p?[0-9]+$//' | sed 's/\/dev\///')
+    PART_NUM=$(echo "$FULL_PART" | grep -oE '[0-9]+$')
+fi
 
 if [ -z "$PARENT_DISK" ] || [ -z "$PART_NUM" ]; then
     echo "❌ No se pudo determinar la estructura de discos de este VPS de forma automática."
     exit 1
 fi
 
-echo "🚀 3. Expandiendo partición física /dev/$PARENT_DISK partición $PART_NUM..."
+echo "🚀 3. Expandiendo partición física /dev/$PARENT_DISK (Partición $PART_NUM)..."
 growpart "/dev/$PARENT_DISK" "$PART_NUM"
 
 echo "🔄 4. Actualizando LVM (si aplica)..."
 pvresize "$FULL_PART" 2>/dev/null
 
-echo "📈 5. Asignando espacio al volumen lógico..."
-lvextend -l +100%FREE "$LV_PATH" 2>/dev/null
+echo "📈 5. Asignando espacio al volumen lógico o partición..."
+if [[ "$LV_PATH" == *"/dev/mapper/"* ]] || [[ "$LV_PATH" == *"/dev/ubuntu-vg/"* ]]; then
+    lvextend -l +100%FREE "$LV_PATH" 2>/dev/null
+fi
 
 echo "🛠️ 6. Redimensionando el sistema de archivos final..."
 resize2fs "$LV_PATH" 2>/dev/null
-xfs_growfs "$LV_PATH" 2>/dev/null # Por si el VPS usa formato XFS en vez de EXT4
+xfs_growfs "$LV_PATH" 2>/dev/null
 
 echo "✅ ¡Expansión remota completada con éxito!"
 df -h "$LV_PATH"
